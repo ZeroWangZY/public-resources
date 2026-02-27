@@ -11,7 +11,6 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "httplib.h"
@@ -22,13 +21,6 @@ struct ExecResult {
   bool timed_out;
   std::string output;
   std::string error;
-};
-
-static const std::unordered_map<std::string, std::string> kLegacyTasks = {
-    {"date", "/bin/date"},
-    {"uptime", "/usr/bin/uptime"},
-    {"df", "/bin/df -h"},
-    {"mem", "/usr/bin/free -m"},
 };
 
 std::string json_escape(const std::string &s) {
@@ -181,10 +173,8 @@ int main() {
   });
 
   svr.Get("/tasks", [](const httplib::Request &, httplib::Response &res) {
-    res.set_content(
-        "{\"mode\":\"direct_command\",\"usage\":\"POST /run with raw command body\","
-        "\"legacy_tasks\":[\"date\",\"uptime\",\"df\",\"mem\"]}",
-        "application/json");
+    res.set_content("{\"mode\":\"direct_command\",\"usage\":\"POST /run with raw command body\"}",
+                    "application/json");
   });
 
   auto authorize = [](const httplib::Request &req, httplib::Response &res) -> bool {
@@ -227,23 +217,6 @@ int main() {
 
     ExecResult r = run_command(command);
     render_result(command, r, res);
-  });
-
-  // Backward-compatible route. Prefer POST /run with raw body.
-  svr.Post(R"(/run/([A-Za-z0-9_-]+))", [authorize, render_result](const httplib::Request &req,
-                                                                   httplib::Response &res) {
-    if (!authorize(req, res)) return;
-    std::string task = req.matches[1];
-    auto it = kLegacyTasks.find(task);
-    if (it == kLegacyTasks.end()) {
-      res.status = 400;
-      res.set_content(
-          "{\"error\":\"task not allowed. use POST /run with raw command body for direct execution\"}",
-          "application/json");
-      return;
-    }
-    ExecResult r = run_command(it->second);
-    render_result(it->second, r, res);
   });
 
   std::cout << "Listening on 0.0.0.0:8081\n";

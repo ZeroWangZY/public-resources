@@ -53,6 +53,33 @@ std::string to_lower_copy(std::string s) {
   return s;
 }
 
+std::string decode_json_string_like(const std::string &s) {
+  if (s.size() < 2 || s.front() != '"' || s.back() != '"') return s;
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 1; i + 1 < s.size(); ++i) {
+    char c = s[i];
+    if (c != '\\') {
+      out.push_back(c);
+      continue;
+    }
+    if (i + 1 >= s.size() - 1) break;
+    char n = s[++i];
+    switch (n) {
+      case 'n': out.push_back('\n'); break;
+      case 'r': out.push_back('\r'); break;
+      case 't': out.push_back('\t'); break;
+      case 'b': out.push_back('\b'); break;
+      case 'f': out.push_back('\f'); break;
+      case '\\': out.push_back('\\'); break;
+      case '"': out.push_back('"'); break;
+      case '/': out.push_back('/'); break;
+      default: out.push_back(n); break;
+    }
+  }
+  return out;
+}
+
 bool is_blocked_command(const std::string &command, std::string &reason) {
   const std::string lower = to_lower_copy(command);
 
@@ -219,12 +246,11 @@ int main() {
     if (!authorize(req, res)) return;
 
     std::string command = trim_copy(req.body);
-    if (command.empty() && req.has_param("cmd")) command = trim_copy(req.get_param_value("cmd"));
+    command = trim_copy(decode_json_string_like(command));
     if (command.empty()) {
       res.status = 400;
-      res.set_content(
-          "{\"error\":\"missing command: send raw command in request body or use cmd query param\"}",
-          "application/json");
+      res.set_content("{\"error\":\"missing command: send command in request body\"}",
+                      "application/json");
       return;
     }
 

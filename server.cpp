@@ -1,5 +1,8 @@
 // server.cpp
+#include <algorithm>
+#include <cctype>
 #include <fcntl.h>
+#include <regex>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -21,11 +24,11 @@ struct ExecResult {
   std::string error;
 };
 
-static const std::unordered_map<std::string, std::vector<std::string>> kTasks = {
-    {"date", {"/bin/date"}},
-    {"uptime", {"/usr/bin/uptime"}},
-    {"df", {"/bin/df", "-h"}},
-    {"mem", {"/usr/bin/free", "-m"}},
+static const std::unordered_map<std::string, std::string> kLegacyTasks = {
+    {"date", "/bin/date"},
+    {"uptime", "/usr/bin/uptime"},
+    {"df", "/bin/df -h"},
+    {"mem", "/usr/bin/free -m"},
 };
 
 std::string json_escape(const std::string &s) {
@@ -44,9 +47,71 @@ std::string json_escape(const std::string &s) {
   return out;
 }
 
-ExecResult run_task(const std::string &task, int timeout_sec = 8) {
-  auto it = kTasks.find(task);
-  if (it == kTasks.end()) return {false, -1, false, "", "task not allowed"};
+std::string trim_copy(const std::string &s) {
+  size_t start = 0;
+  while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) start++;
+  size_t end = s.size();
+  while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) end--;
+  return s.substr(start, end - start);
+}
+
+std::string to_lower_copy(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return s;
+}
+
+bool is_blocked_command(const std::string &command, std::string &reason) {
+  const std::string lower = to_lower_copy(command);
+
+  if (lower.find("--no-preserve-root") != std::string::npos) {
+    reason = "dangerous rm flag";
+    return true;
+  }
+
+  static const std::regex kRmRootRf1(
+      R"(\brm\b[^;&|]*-[^;&|]*r[^;&|]*f[^;&|]*\s+(/\s*($|[;&|])|/\*\s*($|[;&|])))");
+  static const std::regex kRmRootRf2(
+      R"(\brm\b[^;&|]*-[^;&|]*f[^;&|]*r[^;&|]*\s+(/\s*($|[;&|])|/\*\s*($|[;&|])))");
+  if (std::regex_search(lower, kRmRootRf1) || std::regex_search(lower, kRmRootRf2)) {
+    reason = "root filesystem deletion";
+    return true;
+  }
+
+  static const std::vector<std::pair<std::regex, const char *>> kBlockedPatterns = {
+      {std::regex(R"((^|[;&|])\s*(shutdown|reboot|halt|poweroff)\b)"),
+       "power control command"},
+      {std::regex(R"((^|[;&|])\s*init\s+[06]\b)"), "runlevel switch command"},
+      {std::regex(R"((^|[;&|])\s*systemctl\s+(reboot|poweroff|halt)\b)"),
+       "system power control command"},
+      {std::regex(R"((^|[;&|])\s*(mkfs(\.[a-z0-9_+-]+)?|fdisk|sfdisk|parted|wipefs)\b)"),
+       "disk formatting/partition command"},
+      {std::regex(R"((^|[;&|])\s*dd\b)"), "raw disk copy command"},
+      {std::regex(R"(\b(of|if)=/dev/(sd[a-z]\d*|vd[a-z]\d*|nvme\d+n\d+(p\d+)?)\b)"),
+       "block-device access argument"},
+      {std::regex(R"((^|[;&|])\s*:\s*>\s*/dev/(sd[a-z]\d*|vd[a-z]\d*|nvme\d+n\d+(p\d+)?)\b)"),
+       "block-device overwrite"},
+      {std::regex(R"((^|[;&|])\s*kill\s+-9\s+-?1\b)"), "kill-all command"},
+  };
+
+  for (const auto &item : kBlockedPatterns) {
+    if (std::regex_search(lower, item.first)) {
+      reason = item.second;
+      return true;
+    }
+  }
+  return false;
+}
+
+ExecResult run_command(const std::string &command, int timeout_sec = 20) {
+  const std::string trimmed = trim_copy(command);
+  if (trimmed.empty()) return {false, -1, false, "", "empty command"};
+  if (trimmed.size() > 4096) return {false, -1, false, "", "command too long (max 4096 chars)"};
+
+  std::string blocked_reason;
+  if (is_blocked_command(trimmed, blocked_reason)) {
+    return {false, -1, false, "", "blocked command: " + blocked_reason};
+  }
 
   int pipefd[2];
   if (pipe(pipefd) != 0) return {false, -1, false, "", "pipe failed"};
@@ -67,12 +132,9 @@ ExecResult run_task(const std::string &task, int timeout_sec = 8) {
     close(pipefd[0]);
     close(pipefd[1]);
 
-    std::vector<char *> argv;
-    argv.reserve(it->second.size() + 1);
-    for (const auto &s : it->second) argv.push_back(const_cast<char *>(s.c_str()));
-    argv.push_back(nullptr);
-
-    execv(argv[0], argv.data());
+    char *const argv[] = {const_cast<char *>("bash"), const_cast<char *>("-lc"),
+                          const_cast<char *>(trimmed.c_str()), nullptr};
+    execv("/bin/bash", argv);
     _exit(127);
   }
 
@@ -119,32 +181,69 @@ int main() {
   });
 
   svr.Get("/tasks", [](const httplib::Request &, httplib::Response &res) {
-    res.set_content("{\"tasks\":[\"date\",\"uptime\",\"df\",\"mem\"]}", "application/json");
+    res.set_content(
+        "{\"mode\":\"direct_command\",\"usage\":\"POST /run with raw command body\","
+        "\"legacy_tasks\":[\"date\",\"uptime\",\"df\",\"mem\"]}",
+        "application/json");
   });
 
-  svr.Post(R"(/run/([A-Za-z0-9_-]+))", [](const httplib::Request &req, httplib::Response &res) {
+  auto authorize = [](const httplib::Request &req, httplib::Response &res) -> bool {
     const char *token = std::getenv("CMD_SERVICE_TOKEN");
     std::string got = req.get_header_value("X-Token");
     if (!token || got != token) {
       res.status = 401;
       res.set_content("{\"error\":\"unauthorized\"}", "application/json");
-      return;
+      return false;
     }
+    return true;
+  };
 
-    std::string task = req.matches[1];
-    ExecResult r = run_task(task);
-
+  auto render_result = [](const std::string &command, const ExecResult &r, httplib::Response &res) {
     if (!r.ok) {
-      res.status = 400;
+      res.status = (r.error.rfind("blocked command:", 0) == 0) ? 403 : 400;
       res.set_content("{\"error\":\"" + json_escape(r.error) + "\"}", "application/json");
       return;
     }
 
-    std::string body = "{\"task\":\"" + json_escape(task) + "\",\"exit_code\":" +
+    std::string body = "{\"command\":\"" + json_escape(command) + "\",\"exit_code\":" +
                        std::to_string(r.exit_code) + ",\"timed_out\":" +
                        (r.timed_out ? "true" : "false") + ",\"output\":\"" +
                        json_escape(r.output) + "\"}";
     res.set_content(body, "application/json");
+  };
+
+  svr.Post("/run", [authorize, render_result](const httplib::Request &req, httplib::Response &res) {
+    if (!authorize(req, res)) return;
+
+    std::string command = trim_copy(req.body);
+    if (command.empty() && req.has_param("cmd")) command = trim_copy(req.get_param_value("cmd"));
+    if (command.empty()) {
+      res.status = 400;
+      res.set_content(
+          "{\"error\":\"missing command: send raw command in request body or use cmd query param\"}",
+          "application/json");
+      return;
+    }
+
+    ExecResult r = run_command(command);
+    render_result(command, r, res);
+  });
+
+  // Backward-compatible route. Prefer POST /run with raw body.
+  svr.Post(R"(/run/([A-Za-z0-9_-]+))", [authorize, render_result](const httplib::Request &req,
+                                                                   httplib::Response &res) {
+    if (!authorize(req, res)) return;
+    std::string task = req.matches[1];
+    auto it = kLegacyTasks.find(task);
+    if (it == kLegacyTasks.end()) {
+      res.status = 400;
+      res.set_content(
+          "{\"error\":\"task not allowed. use POST /run with raw command body for direct execution\"}",
+          "application/json");
+      return;
+    }
+    ExecResult r = run_command(it->second);
+    render_result(it->second, r, res);
   });
 
   std::cout << "Listening on 0.0.0.0:8081\n";

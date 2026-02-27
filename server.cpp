@@ -173,16 +173,29 @@ int main() {
   });
 
   svr.Get("/tasks", [](const httplib::Request &, httplib::Response &res) {
-    res.set_content("{\"mode\":\"direct_command\",\"usage\":\"POST /run with raw command body\"}",
+    res.set_content(
+        "{\"mode\":\"direct_command\",\"usage\":\"POST /run with raw command body\","
+        "\"auth\":\"Authorization: Bearer <token>\"}",
                     "application/json");
   });
 
-  auto authorize = [](const httplib::Request &req, httplib::Response &res) -> bool {
+  auto parse_authorization = [](const std::string &value) -> std::string {
+    std::string auth = trim_copy(value);
+    if (auth.empty()) return "";
+    std::string lower = to_lower_copy(auth);
+    const std::string prefix = "bearer ";
+    if (lower.rfind(prefix, 0) == 0) return trim_copy(auth.substr(prefix.size()));
+    return auth;
+  };
+
+  auto authorize = [parse_authorization](const httplib::Request &req, httplib::Response &res) -> bool {
     const char *token = std::getenv("CMD_SERVICE_TOKEN");
-    std::string got = req.get_header_value("X-Token");
+    std::string got = parse_authorization(req.get_header_value("Authorization"));
     if (!token || got != token) {
       res.status = 401;
-      res.set_content("{\"error\":\"unauthorized\"}", "application/json");
+      res.set_content(
+          "{\"error\":\"unauthorized: expected Authorization header (Bearer <token>)\"}",
+          "application/json");
       return false;
     }
     return true;
